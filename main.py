@@ -1,90 +1,22 @@
-# from openai import OpenAI
-# import pandas as pd
-# import os
-# from dotenv import load_dotenv
-#
-# load_dotenv()
-#
-# client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-#
-# shap_reasons = pd.read_csv('/Users/arlan/Desktop/hacknu/shap_top_reasons_per_user.csv')
-#
-#
-# def generate_explanation(user_id, proba, user_shap_df):
-#     lines = []
-#     for _, row in user_shap_df.iterrows():
-#         direction = "увеличивает риск отмены" if row['shap_value'] > 0 else "снижает риск отмены"
-#         lines.append(
-#             f"- {row['feature']} = {row['feature_value']} → {direction} (impact: {row['shap_value']:+.3f})")
-#
-#     features_text = "\n".join(lines)
-#
-#     prompt = f"""Ты аналитик продукта. Пользователь с вероятностью отмены подписки {proba:.1%}.
-#
-# Вот какие факторы повлияли на это решение модели:
-# {features_text}
-#
-# Напиши 2-3 предложения для Product Manager:
-# 1. Почему этот пользователь скорее всего отменит подписку
-# 2. Что конкретно рекомендуешь сделать
-#
-# Пиши просто, без технических терминов, без упоминания SHAP или модели."""
-#
-#     response = client.chat.completions.create(
-#         model="gpt-4o-mini",
-#         messages=[{"role": "user", "content": prompt}],
-#         max_tokens=300
-#     )
-#     return response.choices[0].message.content.strip()
-#
-#
-# top_users = (
-#     shap_reasons.groupby('user_id')['probability_vol_churn']
-#     .first()
-#     .sort_values(ascending=False)
-#     .head(20)
-#     .index.tolist()
-# )
-#
-# results = []
-# for user_id in top_users:
-#     user_df = shap_reasons[shap_reasons['user_id'] == user_id]
-#     proba = user_df['probability_vol_churn'].iloc[0]
-#
-#     explanation = generate_explanation(user_id, proba, user_df)
-#
-#     results.append({
-#         'user_id': user_id,
-#         'churn_probability': proba,
-#         'explanation': explanation
-#     })
-#     print(f"✓ user_id={user_id} | proba={proba:.3f}")
-#     print(explanation)
-#     print("---")
-#
-# explanations_df = pd.DataFrame(results)
-# explanations_df.to_csv('/Users/arlan/Desktop/hacknu/llm_explanations.csv', index=False)
-# print("Saved: llm_explanations.csv")
 from __future__ import annotations
 
 import os
 from pathlib import Path
 from typing import Optional
-
+from fastapi.responses import HTMLResponse
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from pydantic import BaseModel
-
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-CSV_PATH = Path(os.getenv("CSV_PATH", BASE_DIR / "shap_top_reasons_per_user.csv"))
+CSV_PATH = Path(os.getenv("CSV_PATH", BASE_DIR / "shap_test_top_reasons_per_user.csv"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+THRESHOLD = float(os.getenv("CHURN_THRESHOLD", "0.3"))
 
 app = FastAPI(title="AI Churn Analyst API", version="0.1.0")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -104,13 +36,16 @@ def load_data() -> pd.DataFrame:
         raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
 
     df = pd.read_csv(CSV_PATH)
+
     missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
+    df["user_id"] = df["user_id"].astype(str)
     df["probability_vol_churn"] = pd.to_numeric(df["probability_vol_churn"], errors="coerce")
     df["shap_value"] = pd.to_numeric(df["shap_value"], errors="coerce")
     df["abs_shap"] = pd.to_numeric(df["abs_shap"], errors="coerce")
+
     return df
 
 
@@ -120,9 +55,11 @@ def get_df() -> pd.DataFrame:
 
 def user_frame(user_id: str) -> pd.DataFrame:
     df = get_df()
-    user_df = df[df["user_id"] == user_id].copy()
+    user_df = df[df["user_id"] == str(user_id)].copy()
+
     if user_df.empty:
         raise HTTPException(status_code=404, detail="User not found")
+
     return user_df.sort_values("abs_shap", ascending=False)
 
 
@@ -187,7 +124,11 @@ class UserDetail(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "csv_path": str(CSV_PATH)}
+    return {
+        "status": "ok",
+        "csv_path": str(CSV_PATH),
+        "threshold": THRESHOLD,
+    }
 
 
 @app.get("/stats")
@@ -195,7 +136,8 @@ def stats() -> dict:
     df = get_df()
     per_user = df.groupby("user_id", as_index=False)["probability_vol_churn"].first()
     avg_risk = float(per_user["probability_vol_churn"].mean()) if not per_user.empty else 0.0
-    high_risk = int((per_user["probability_vol_churn"] >= 0.5).sum())
+    high_risk = int((per_user["probability_vol_churn"] >= THRESHOLD).sum())
+
     return {
         "users": int(per_user["user_id"].nunique()),
         "avg_risk": avg_risk,
@@ -217,8 +159,9 @@ def list_users(limit: int = Query(default=20, ge=1, le=200)) -> list[UserSummary
     top_by_user = top_by_user.sort_values("probability_vol_churn", ascending=False).head(limit)
 
     items: list[UserSummary] = []
+
     for _, row in top_by_user.iterrows():
-        user_id = row["user_id"]
+        user_id = str(row["user_id"])
         user_df = df[df["user_id"] == user_id].sort_values("abs_shap", ascending=False)
 
         positive = user_df[user_df["shap_value"] > 0]["feature"].head(1)
@@ -232,6 +175,7 @@ def list_users(limit: int = Query(default=20, ge=1, le=200)) -> list[UserSummary
                 top_negative_driver=None if negative.empty else str(negative.iloc[0]),
             )
         )
+
     return items
 
 
@@ -240,10 +184,11 @@ def get_user(user_id: str, top_n: int = Query(default=8, ge=3, le=20)) -> UserDe
     user_df = user_frame(user_id)
     proba = float(user_df["probability_vol_churn"].iloc[0])
     reasons = [summarize_reason(row) for _, row in user_df.head(top_n).iterrows()]
+
     return UserDetail(
-        user_id=user_id,
+        user_id=str(user_id),
         churn_probability=proba,
-        predicted_label="voluntary_churn" if proba >= 0.5 else "not_churned",
+        predicted_label="vol_churn" if proba >= THRESHOLD else "not_churned",
         top_reasons=reasons,
     )
 
@@ -256,24 +201,27 @@ def get_user_explanation(user_id: str, top_n: int = Query(default=8, ge=3, le=20
 
     if client is None:
         return {
-            "user_id": user_id,
+            "user_id": str(user_id),
             "churn_probability": proba,
+            "predicted_label": "vol_churn" if proba >= THRESHOLD else "not_churned",
             "explanation": "OPENAI_API_KEY is not configured.",
         }
 
-    prompt = build_prompt(user_id, proba, reasons)
+    prompt = build_prompt(str(user_id), proba, reasons)
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=220,
     )
+
     explanation = response.choices[0].message.content.strip()
+
     return {
-        "user_id": user_id,
+        "user_id": str(user_id),
         "churn_probability": proba,
+        "predicted_label": "vol_churn" if proba >= THRESHOLD else "not_churned",
         "explanation": explanation,
     }
-
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
